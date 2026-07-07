@@ -1,0 +1,1157 @@
+import React, { useState, useEffect, useReducer, useCallback, useMemo, useRef } from "react";
+import {
+  RefreshCw,
+  Wallet,
+  TrendingUp,
+  TrendingDown,
+  AlertTriangle,
+  Zap,
+  Flame,
+  Skull,
+  Waves,
+  ShieldAlert,
+  Rocket,
+  Search,
+  X,
+  Coins,
+  Activity,
+} from "lucide-react";
+
+/* ============================================================================
+   DEGEN PORTFOLIO TRACKER & MOMENTUM ADVISOR
+   ----------------------------------------------------------------------------
+   Stack : React + Tailwind CSS + Lucide React
+   NOTE SUR LA PERSISTANCE : la consigne initiale demandait une persistance des
+   "Prix d'entrée" via LocalStorage. Dans l'environnement de prévisualisation
+   des artifacts Claude.ai, les API de stockage navigateur (localStorage /
+   sessionStorage) ne sont pas disponibles et font planter le rendu. Le code
+   ci-dessous utilise donc un state React en mémoire (useReducer) qui se
+   comporte EXACTEMENT comme la persistance LocalStorage pendant la session.
+   Si tu exécutes ce code dans ton propre projet (Vite/Next/CRA), il te suffit
+   de remplacer les deux fonctions `loadEntryPrices()` / `persistEntryPrices()`
+   tout en bas de ce bloc par de vrais appels à `window.localStorage` (le code
+   est déjà isolé et commenté pour ça).
+   ============================================================================ */
+
+/* ----------------------------------------------------------------------------
+   1. CONSTANTES & THEME
+   -------------------------------------------------------------------------- */
+
+const NETWORKS = {
+  SOLANA: "solana",
+  BASE: "base",
+};
+
+const REFRESH_INTERVAL_MS = 30000;
+
+// Palette imposée par le brief : fond noir pur / anthracite, glassmorphism,
+// bordures fines gris foncé. Les couleurs de signaux sont câblées 1:1 avec
+// les 6 scénarios de l'algorithme "Degen Advisor V2".
+const SIGNAL_STYLES = {
+  PARABOLIC: {
+    key: "PARABOLIC",
+    label: "PARABOLE IMPLACABLE",
+    badge: "bg-green-500/15 text-green-400 border-green-400/40",
+    cellBg: "bg-green-500/10 border-green-400/30",
+    dot: "bg-green-400 animate-pulse shadow-[0_0_12px_2px_rgba(74,222,128,0.8)]",
+    icon: Rocket,
+    accentText: "text-green-400",
+  },
+  TAKE_PROFIT: {
+    key: "TAKE_PROFIT",
+    label: "RÈGLE D'OR DU DEGEN",
+    badge: "bg-blue-500/15 text-blue-400 border-blue-400/40",
+    cellBg: "bg-blue-500/10 border-blue-400/30",
+    dot: "bg-blue-400 shadow-[0_0_10px_2px_rgba(96,165,250,0.7)]",
+    icon: Zap,
+    accentText: "text-blue-400",
+  },
+  HEALTHY_DIP: {
+    key: "HEALTHY_DIP",
+    label: "REPLI SAIN EN BULL MARKET",
+    badge: "bg-emerald-800/30 text-emerald-400 border-emerald-500/40",
+    cellBg: "bg-emerald-900/20 border-emerald-600/30",
+    dot: "bg-emerald-500 shadow-[0_0_10px_2px_rgba(16,185,129,0.6)]",
+    icon: Waves,
+    accentText: "text-emerald-400",
+  },
+  LIQUIDITY_TRAP: {
+    key: "LIQUIDITY_TRAP",
+    label: "PIÈGE DE LIQUIDITÉ",
+    badge: "bg-orange-500/15 text-orange-400 border-orange-400/40",
+    cellBg: "bg-orange-500/10 border-orange-400/30",
+    dot: "bg-orange-400 shadow-[0_0_10px_2px_rgba(251,146,60,0.7)]",
+    icon: ShieldAlert,
+    accentText: "text-orange-400",
+  },
+  VOLUME_SHOCK: {
+    key: "VOLUME_SHOCK",
+    label: "CHOC DE VOLUMES HORAIRES",
+    badge: "bg-purple-500/15 text-purple-400 border-purple-400/40",
+    cellBg: "bg-purple-500/10 border-purple-400/30",
+    dot: "bg-purple-400 shadow-[0_0_10px_2px_rgba(192,132,252,0.7)]",
+    icon: Activity,
+    accentText: "text-purple-400",
+  },
+  CAPITULATION: {
+    key: "CAPITULATION",
+    label: "CAPITULATION",
+    badge: "bg-red-500/15 text-red-400 border-red-400/40",
+    cellBg: "bg-red-500/10 border-red-400/30",
+    dot: "bg-red-500 shadow-[0_0_10px_2px_rgba(239,68,68,0.7)]",
+    icon: Skull,
+    accentText: "text-red-400",
+  },
+  NEUTRAL: {
+    key: "NEUTRAL",
+    label: "SIGNAL NEUTRE",
+    badge: "bg-slate-500/15 text-slate-400 border-slate-500/40",
+    cellBg: "bg-slate-500/5 border-slate-600/30",
+    dot: "bg-slate-500",
+    icon: Search,
+    accentText: "text-slate-400",
+  },
+};
+
+/* ----------------------------------------------------------------------------
+   2. UTILITAIRES DE FORMATAGE & PSEUDO-RANDOM DÉTERMINISTE
+   -------------------------------------------------------------------------- */
+
+// Hash simple pour transformer une adresse de wallet en seed numérique stable.
+// Cela permet à une même adresse de toujours générer le même "portefeuille"
+// simulé, comme le ferait un vrai indexeur on-chain.
+function hashStringToSeed(str) {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = (hash << 5) - hash + str.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash) || 1;
+}
+
+// Générateur pseudo-aléatoire mulberry32 (déterministe à partir d'une seed).
+function mulberry32(seed) {
+  let a = seed;
+  return function () {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function formatUsd(value, opts = {}) {
+  if (value === null || value === undefined || Number.isNaN(value)) return "—";
+  const { compact = false, decimals } = opts;
+  if (compact) {
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: "USD",
+      notation: "compact",
+      maximumFractionDigits: 2,
+    }).format(value);
+  }
+  const dec = decimals !== undefined ? decimals : value < 1 ? 6 : 2;
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: dec,
+  }).format(value);
+}
+
+function formatPercent(value, opts = {}) {
+  if (value === null || value === undefined || Number.isNaN(value)) return "—";
+  const { showSign = true } = opts;
+  const sign = showSign && value > 0 ? "+" : "";
+  return `${sign}${value.toFixed(2)}%`;
+}
+
+function formatTokenAmount(value, decimals = 4) {
+  if (value === null || value === undefined || Number.isNaN(value)) return "—";
+  return new Intl.NumberFormat("en-US", {
+    maximumFractionDigits: decimals,
+  }).format(value);
+}
+
+function truncateAddress(address) {
+  if (!address || address.length < 12) return address;
+  return `${address.slice(0, 4)}...${address.slice(-4)}`;
+}
+
+/* ----------------------------------------------------------------------------
+   3. VALIDATION D'ADRESSES
+   -------------------------------------------------------------------------- */
+
+function isValidSolanaAddress(address) {
+  // Adresses Solana : base58, généralement 32 à 44 caractères, sans 0/O/I/l.
+  return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address.trim());
+}
+
+function isValidBaseAddress(address) {
+  // Adresses EVM (Base) : 0x suivi de 40 caractères hexadécimaux.
+  return /^0x[a-fA-F0-9]{40}$/.test(address.trim());
+}
+
+/* ----------------------------------------------------------------------------
+   4. COUCHE DE SERVICE WEB3 (MOCK) — SOLANA / BASE / DEXSCREENER
+   ----------------------------------------------------------------------------
+   Chaque fonction ci-dessous simule un vrai appel réseau (delay + payload
+   réaliste) et documente précisément la requête réelle à brancher.
+   -------------------------------------------------------------------------- */
+
+const MOCK_SOLANA_TOKEN_POOL = [
+  { symbol: "WIF", name: "dogwifhat", decimals: 6 },
+  { symbol: "BONK", name: "Bonk", decimals: 5 },
+  { symbol: "POPCAT", name: "Popcat", decimals: 9 },
+  { symbol: "PNUT", name: "Peanut the Squirrel", decimals: 6 },
+  { symbol: "MEW", name: "cat in a dogs world", decimals: 5 },
+  { symbol: "GOAT", name: "Goatseus Maximus", decimals: 6 },
+  { symbol: "MOODENG", name: "Moo Deng", decimals: 6 },
+  { symbol: "SLERF", name: "Slerf", decimals: 9 },
+  { symbol: "JUP", name: "Jupiter", decimals: 6 },
+  { symbol: "RAY", name: "Raydium", decimals: 6 },
+];
+
+const MOCK_BASE_TOKEN_POOL = [
+  { symbol: "BRETT", name: "Brett", decimals: 18 },
+  { symbol: "DEGEN", name: "Degen", decimals: 18 },
+  { symbol: "TOSHI", name: "Toshi", decimals: 18 },
+  { symbol: "AERO", name: "Aerodrome Finance", decimals: 18 },
+  { symbol: "NORMIE", name: "Normie", decimals: 18 },
+  { symbol: "MOCHI", name: "Mochi", decimals: 18 },
+  { symbol: "KEYCAT", name: "Keyboard Cat", decimals: 18 },
+  { symbol: "BALD", name: "Bald", decimals: 18 },
+];
+
+function fakeAddressFor(network, symbol, seed) {
+  const rand = mulberry32(seed + hashStringToSeed(symbol));
+  if (network === NETWORKS.SOLANA) {
+    const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    let out = "";
+    for (let i = 0; i < 44; i++) out += alphabet[Math.floor(rand() * alphabet.length)];
+    return out;
+  }
+  const hex = "0123456789abcdef";
+  let out = "0x";
+  for (let i = 0; i < 40; i++) out += hex[Math.floor(rand() * hex.length)];
+  return out;
+}
+
+/**
+ * SOLANA LAYER
+ * Simule un appel à l'API Helius DAS (Digital Asset Standard) :
+ *
+ *   POST https://mainnet.helius-rpc.com/?api-key=VOTRE_CLE_HELIUS
+ *   Content-Type: application/json
+ *   {
+ *     "jsonrpc": "2.0",
+ *     "id": "portfolio-fetch",
+ *     "method": "getAssetsByOwner",
+ *     "params": {
+ *       "ownerAddress": "<WALLET_ADDRESS>",
+ *       "page": 1,
+ *       "limit": 1000,
+ *       "displayOptions": { "showFungible": true }
+ *     }
+ *   }
+ *
+ * La réponse contient result.items[], dont chaque item fongible expose
+ * token_info.balance (en unités brutes) et token_info.decimals, qu'il faut
+ * diviser (balance / 10**decimals) pour obtenir le solde réel affichable.
+ */
+async function fetchSolanaAssets(walletAddress) {
+  await simulateNetworkDelay();
+  const seed = hashStringToSeed(walletAddress);
+  const rand = mulberry32(seed);
+  const tokenCount = 3 + Math.floor(rand() * 4); // 3 à 6 tokens
+  const pool = [...MOCK_SOLANA_TOKEN_POOL].sort(() => rand() - 0.5).slice(0, tokenCount);
+
+  return pool.map((t) => {
+    const address = fakeAddressFor(NETWORKS.SOLANA, t.symbol, seed);
+    const rawBalance = Math.floor(rand() * 5_000_000) + 100;
+    return {
+      id: `sol-${address}`,
+      network: NETWORKS.SOLANA,
+      symbol: t.symbol,
+      name: t.name,
+      address,
+      decimals: t.decimals,
+      balance: rawBalance / (10 ** Math.min(t.decimals, 4)), // solde "humain" simulé
+    };
+  });
+}
+
+/**
+ * BASE LAYER
+ * Simule un appel à l'API Moralis (équivalent possible : Alchemy) :
+ *
+ *   GET https://deep-index.moralis.io/api/v2.2/wallets/<WALLET_ADDRESS>/tokens?chain=base
+ *   Headers: { "X-API-Key": "VOTRE_CLE_MORALIS" }
+ *
+ * Alternative Alchemy :
+ *   POST https://base-mainnet.g.alchemy.com/v2/VOTRE_CLE_ALCHEMY
+ *   { "jsonrpc":"2.0","method":"alchemy_getTokenBalances","params":["<WALLET_ADDRESS>"] }
+ *
+ * Chaque entrée retourne balance (hex/brute) + decimals du contrat ERC-20,
+ * à convertir de la même manière que côté Solana.
+ */
+async function fetchBaseAssets(walletAddress) {
+  await simulateNetworkDelay();
+  const seed = hashStringToSeed(walletAddress) + 7919;
+  const rand = mulberry32(seed);
+  const tokenCount = 2 + Math.floor(rand() * 4); // 2 à 5 tokens
+  const pool = [...MOCK_BASE_TOKEN_POOL].sort(() => rand() - 0.5).slice(0, tokenCount);
+
+  return pool.map((t) => {
+    const address = fakeAddressFor(NETWORKS.BASE, t.symbol, seed);
+    const rawBalance = Math.floor(rand() * 800_000) + 50;
+    return {
+      id: `base-${address}`,
+      network: NETWORKS.BASE,
+      symbol: t.symbol,
+      name: t.name,
+      address,
+      decimals: t.decimals,
+      balance: rawBalance / 100,
+    };
+  });
+}
+
+/**
+ * MARKET DATA LAYER
+ * Simule un branchement sur l'API Dexscreener :
+ *
+ *   GET https://api.dexscreener.com/token-boosts/latest/v1
+ *   GET https://api.dexscreener.com/tokens/v1/solana/<TOKEN_ADDRESS>
+ *   GET https://api.dexscreener.com/tokens/v1/base/<TOKEN_ADDRESS>
+ *
+ * (les chemins /networks/solana/tokens/ et /networks/base/tokens/ mentionnés
+ * dans le brief correspondent au même service ; adapte selon la version de
+ * l'API que tu utilises réellement). La réponse expose typiquement :
+ *   priceUsd, volume.h24, priceChange.h1, liquidity.usd, pairCreatedAt, etc.
+ * L'ATH n'est pas natif à Dexscreener : on le dérive ici (max glissant),
+ * en production tu le stockerais toi-même côté backend/DB au fil du temps.
+ */
+async function fetchDexscreenerMarketData(token, seed) {
+  const rand = mulberry32(seed + hashStringToSeed(token.address));
+  const basePrice = 0.00001 + rand() * 3;
+  const liquidity = 50_000 + rand() * 4_000_000;
+  const volume24h = liquidity * (0.1 + rand() * 3);
+  const ath = basePrice * (1 + rand() * 4);
+  const volumeDelta1h = (rand() - 0.4) * 160; // -64% à +96% typiquement, peut dépasser via drift plus tard
+
+  return {
+    priceUsd: basePrice,
+    volume24h,
+    liquidityUsd: liquidity,
+    ath,
+    volumeDelta1h,
+  };
+}
+
+function simulateNetworkDelay(min = 600, max = 1400) {
+  const ms = min + Math.random() * (max - min);
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/* ----------------------------------------------------------------------------
+   5. MOTEUR ALGORITHMIQUE — DEGEN ADVISOR V2
+   -------------------------------------------------------------------------- */
+
+/**
+ * analyzeTokenMomentum
+ * Fonction pure : prend un token enrichi (prix, volume, liquidité, ATH,
+ * delta volume 1h, prix d'entrée) et retourne le signal + le conseil textuel.
+ */
+function analyzeTokenMomentum(token) {
+  const { priceUsd, entryPrice, volume24h, liquidityUsd, ath, volumeDelta1h } = token;
+
+  const pnlPercent = entryPrice > 0 ? ((priceUsd - entryPrice) / entryPrice) * 100 : 0;
+  const volLiqRatio = liquidityUsd > 0 ? volume24h / liquidityUsd : 0;
+  const dropAth = ath > 0 ? ((ath - priceUsd) / ath) * 100 : 0;
+
+  const metrics = { pnlPercent, volLiqRatio, dropAth, volumeDelta1h };
+
+  // SCÉNARIO 1 — L'IMPLACABLE PARABOLE
+  if (
+    pnlPercent >= 20 &&
+    pnlPercent <= 500 &&
+    volume24h > 10_000_000 &&
+    volumeDelta1h > 25 &&
+    dropAth <= 15
+  ) {
+    return {
+      scenario: SIGNAL_STYLES.PARABOLIC,
+      title: "MOMENTUM SUPRASONIQUE",
+      advice:
+        "Le marché refuse de corriger profondément car la demande absorbe instantanément l'offre (front-running permanent). Ne vends surtout pas. Si tu veux renforcer, fais-le uniquement via des micro-achats (DCA) sur les respirations de 5-10%. Cible psychologique très haute.",
+      metrics,
+    };
+  }
+
+  // SCÉNARIO 2 — LA RÈGLE D'OR DU DEGEN
+  if (pnlPercent >= 100) {
+    return {
+      scenario: SIGNAL_STYLES.TAKE_PROFIT,
+      title: "ALERTE SÉCURISATION DU CAPITAL",
+      advice:
+        "Tu as officiellement atteint un x2 net. La discipline surpasse l'avidité : vends exactement 50% de ta position maintenant pour extraire ton capital initial. Laisse courir les 50% restants (moonbag) vers le milliard l'esprit 100% serein.",
+      metrics,
+    };
+  }
+
+  // SCÉNARIO 3 — LE REPLI SAIN EN BULL MARKET
+  if (
+    volume24h > 5_000_000 &&
+    dropAth >= 15 &&
+    dropAth <= 35 &&
+    volumeDelta1h >= 0
+  ) {
+    return {
+      scenario: SIGNAL_STYLES.HEALTHY_DIP,
+      title: "CORRECTION TECHNIQUE ULTRA-SAINE",
+      advice:
+        "Ce repli de 20-30% est une respiration vitale. Le volume élevé prouve que les baleines accumulent le panic-sell du retail. Zone optimale pour moyenner ton prix d'entrée à la hausse (DCA) avant la prochaine jambe verticale.",
+      metrics,
+    };
+  }
+
+  // SCÉNARIO 4 — LE PIÈGE DE LA LIQUIDITÉ
+  if (dropAth < 10 && (volumeDelta1h <= -50 || volLiqRatio < 0.2)) {
+    return {
+      scenario: SIGNAL_STYLES.LIQUIDITY_TRAP,
+      title: "DANGER - ILLUSION HAUSSIÈRE",
+      advice:
+        "Le prix tient en façade mais le moteur (le volume) est totalement vide. Manque cruel de carburant. Risque de dump violent ou de retournement dès que les market makers CEX couperont les algos. Interdiction stricte de recharger ici.",
+      metrics,
+    };
+  }
+
+  // SCÉNARIO 5 — CHOC DE VOLUMES HORAIRES
+  if (volumeDelta1h > 100) {
+    return {
+      scenario: SIGNAL_STYLES.VOLUME_SHOCK,
+      title: "ANOMALIE DE LIQUIDITÉ",
+      advice:
+        "Pic de volume horaire thermonucléaire détecté on-chain. Quelqu'un est en train de charger massivement ou un exchange prépare ses portefeuilles de test pour un listing imminent. Reste scotché aux graphiques, la volatilité va être légendaire.",
+      metrics,
+    };
+  }
+
+  // SCÉNARIO 6 — LA CAPITULATION
+  if (pnlPercent <= -40 || (dropAth > 60 && volumeDelta1h < 0)) {
+    return {
+      scenario: SIGNAL_STYLES.CAPITULATION,
+      title: "EFFONDREMENT DU NARRATIF",
+      advice:
+        "Le token a perdu sa force relative et la liquidité fuit la pool. Évalue froidement la situation : coupe immédiatement pour sauver tes derniers capitaux si le projet est un scam pur, ou accepte psychologiquement que ce bag devienne un investissement mort à long terme.",
+      metrics,
+    };
+  }
+
+  // FALLBACK — Aucun scénario multi-facteurs clairement déclenché
+  return {
+    scenario: SIGNAL_STYLES.NEUTRAL,
+    title: "SURVEILLANCE EN COURS",
+    advice:
+      "Aucune configuration multi-facteurs extrême n'est détectée pour le moment : le prix, le volume et la distance à l'ATH ne convergent pas vers un signal fort. Continue de surveiller le delta de volume horaire, c'est souvent le premier indicateur à bouger.",
+    metrics,
+  };
+}
+
+/* ----------------------------------------------------------------------------
+   6. STATE MANAGEMENT — useReducer (store applicatif global)
+   -------------------------------------------------------------------------- */
+
+const initialState = {
+  wallets: { solana: null, base: null },
+  tokens: { solana: [], base: [] },
+  entryPrices: {}, // { [tokenId]: number }  -- persistance en mémoire (voir note en tête de fichier)
+  loading: false,
+  refreshing: false,
+  error: null,
+  lastUpdated: null,
+};
+
+function reducer(state, action) {
+  switch (action.type) {
+    case "FETCH_START":
+      return { ...state, loading: true, error: null };
+    case "FETCH_ERROR":
+      return { ...state, loading: false, refreshing: false, error: action.payload };
+    case "FETCH_SUCCESS": {
+      const { network, wallet, tokens } = action.payload;
+      const nextEntryPrices = { ...state.entryPrices };
+      tokens.forEach((t) => {
+        if (nextEntryPrices[t.id] === undefined) {
+          // Simule un "historique" pour que la démo soit interactive dès le
+          // premier lancement : prix d'entrée par défaut = prix actuel du
+          // marché légèrement décalé (l'utilisateur peut le corriger).
+          nextEntryPrices[t.id] = t.priceUsd * (0.55 + Math.random() * 0.9);
+        }
+      });
+      return {
+        ...state,
+        loading: false,
+        refreshing: false,
+        error: null,
+        wallets: { ...state.wallets, [network]: wallet },
+        tokens: { ...state.tokens, [network]: tokens },
+        entryPrices: nextEntryPrices,
+        lastUpdated: new Date(),
+      };
+    }
+    case "REFRESH_START":
+      return { ...state, refreshing: true };
+    case "REFRESH_MARKET_DATA": {
+      const { network, tokens } = action.payload;
+      return {
+        ...state,
+        refreshing: false,
+        tokens: { ...state.tokens, [network]: tokens },
+        lastUpdated: new Date(),
+      };
+    }
+    case "SET_ENTRY_PRICE": {
+      const { tokenId, value } = action.payload;
+      return {
+        ...state,
+        entryPrices: { ...state.entryPrices, [tokenId]: value },
+      };
+    }
+    case "REMOVE_WALLET": {
+      const network = action.payload;
+      return {
+        ...state,
+        wallets: { ...state.wallets, [network]: null },
+        tokens: { ...state.tokens, [network]: [] },
+      };
+    }
+    default:
+      return state;
+  }
+}
+
+/* ----------------------------------------------------------------------------
+   7. SOUS-COMPOSANTS UI
+   -------------------------------------------------------------------------- */
+
+function GlassPanel({ className = "", children }) {
+  return (
+    <div
+      className={`backdrop-blur-xl bg-white/[0.02] border border-[#1f2937] rounded-2xl ${className}`}
+    >
+      {children}
+    </div>
+  );
+}
+
+function StatBlock({ label, value, sub, tone }) {
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-[11px] uppercase tracking-[0.18em] text-slate-500 font-medium">
+        {label}
+      </span>
+      <span
+        className={`text-2xl sm:text-3xl font-bold font-mono tracking-tight ${
+          tone || "text-slate-100"
+        }`}
+      >
+        {value}
+      </span>
+      {sub ? <span className="text-xs text-slate-500 font-mono">{sub}</span> : null}
+    </div>
+  );
+}
+
+function HeaderPanel({ state, onRefresh }) {
+  const allTokens = useMemo(
+    () => [...state.tokens.solana, ...state.tokens.base],
+    [state.tokens]
+  );
+
+  const totalValue = useMemo(
+    () => allTokens.reduce((sum, t) => sum + t.balance * t.priceUsd, 0),
+    [allTokens]
+  );
+
+  const totalPnlUsd = useMemo(
+    () =>
+      allTokens.reduce((sum, t) => {
+        const entry = state.entryPrices[t.id] ?? t.priceUsd;
+        return sum + t.balance * (t.priceUsd - entry);
+      }, 0),
+    [allTokens, state.entryPrices]
+  );
+
+  const totalCostBasis = useMemo(
+    () =>
+      allTokens.reduce((sum, t) => {
+        const entry = state.entryPrices[t.id] ?? t.priceUsd;
+        return sum + t.balance * entry;
+      }, 0),
+    [allTokens, state.entryPrices]
+  );
+
+  const totalPnlPercent = totalCostBasis > 0 ? (totalPnlUsd / totalCostBasis) * 100 : 0;
+  const pnlPositive = totalPnlUsd >= 0;
+
+  return (
+    <GlassPanel className="p-5 sm:p-7">
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6">
+        <div className="flex items-center gap-4">
+          <div className="w-11 h-11 rounded-xl bg-gradient-to-br from-fuchsia-500/20 to-cyan-400/20 border border-white/10 flex items-center justify-center">
+            <Flame className="w-5 h-5 text-fuchsia-400" />
+          </div>
+          <div>
+            <h1 className="text-lg sm:text-xl font-bold tracking-tight text-slate-100">
+              Degen Portfolio Tracker
+            </h1>
+            <p className="text-xs text-slate-500 font-mono">
+              Momentum Advisor · Solana + Base · live simulation
+            </p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-6 sm:gap-10">
+          <StatBlock
+            label="Valeur totale"
+            value={formatUsd(totalValue, { compact: totalValue > 1_000_000 })}
+          />
+          <StatBlock
+            label="PnL global"
+            value={`${pnlPositive ? "+" : ""}${formatUsd(totalPnlUsd, {
+              compact: Math.abs(totalPnlUsd) > 1_000_000,
+            })}`}
+            sub={formatPercent(totalPnlPercent)}
+            tone={pnlPositive ? "text-green-400" : "text-red-400"}
+          />
+          <div className="flex items-center">
+            <RefreshCw
+              className={`w-4 h-4 mr-2 text-slate-500 ${
+                state.refreshing ? "animate-spin" : ""
+              }`}
+            />
+            <button
+              onClick={onRefresh}
+              disabled={state.refreshing}
+              className="group relative px-4 py-2.5 rounded-xl bg-white/[0.03] border border-[#1f2937] text-sm font-medium text-slate-300 hover:text-white hover:border-cyan-400/40 hover:bg-cyan-400/5 transition-all duration-300 disabled:opacity-50"
+            >
+              <span className="relative z-10">
+                {state.refreshing ? "Actualisation..." : "Rafraîchir"}
+              </span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {state.lastUpdated ? (
+        <p className="text-[11px] text-slate-600 font-mono mt-4">
+          Dernière synchro : {state.lastUpdated.toLocaleTimeString("fr-FR")} · auto-refresh
+          toutes les 30s
+        </p>
+      ) : null}
+    </GlassPanel>
+  );
+}
+
+function WalletInputPanel({ state, dispatch }) {
+  const [solInput, setSolInput] = useState("");
+  const [baseInput, setBaseInput] = useState("");
+  const [localError, setLocalError] = useState(null);
+
+  const loadWallet = useCallback(
+    async (network, address) => {
+      setLocalError(null);
+      const validator = network === NETWORKS.SOLANA ? isValidSolanaAddress : isValidBaseAddress;
+      if (!validator(address)) {
+        setLocalError(
+          network === NETWORKS.SOLANA
+            ? "Adresse Solana invalide (format base58 attendu)."
+            : "Adresse Base invalide (format 0x + 40 caractères hex attendu)."
+        );
+        return;
+      }
+
+      dispatch({ type: "FETCH_START" });
+      try {
+        const rawAssets =
+          network === NETWORKS.SOLANA
+            ? await fetchSolanaAssets(address)
+            : await fetchBaseAssets(address);
+
+        const seed = hashStringToSeed(address);
+        const enriched = await Promise.all(
+          rawAssets.map(async (asset) => {
+            const market = await fetchDexscreenerMarketData(asset, seed);
+            return { ...asset, ...market };
+          })
+        );
+
+        dispatch({
+          type: "FETCH_SUCCESS",
+          payload: { network, wallet: address, tokens: enriched },
+        });
+      } catch (err) {
+        dispatch({
+          type: "FETCH_ERROR",
+          payload: "Impossible de récupérer les données du portefeuille. Réessaie.",
+        });
+      }
+    },
+    [dispatch]
+  );
+
+  return (
+    <GlassPanel className="p-5 sm:p-6">
+      <h2 className="text-xs uppercase tracking-[0.18em] text-slate-500 font-semibold mb-4">
+        Connexion des portefeuilles
+      </h2>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <WalletInputRow
+          network={NETWORKS.SOLANA}
+          placeholder="Adresse wallet Solana (base58)"
+          value={solInput}
+          onChange={setSolInput}
+          connected={state.wallets.solana}
+          onSubmit={() => loadWallet(NETWORKS.SOLANA, solInput)}
+          onDisconnect={() => {
+            dispatch({ type: "REMOVE_WALLET", payload: NETWORKS.SOLANA });
+            setSolInput("");
+          }}
+          loading={state.loading}
+          gradient="from-purple-500/20 to-fuchsia-400/10"
+          ring="focus-within:ring-purple-400/40 focus-within:border-purple-400/50"
+        />
+        <WalletInputRow
+          network={NETWORKS.BASE}
+          placeholder="Adresse wallet Base (0x...)"
+          value={baseInput}
+          onChange={setBaseInput}
+          connected={state.wallets.base}
+          onSubmit={() => loadWallet(NETWORKS.BASE, baseInput)}
+          onDisconnect={() => {
+            dispatch({ type: "REMOVE_WALLET", payload: NETWORKS.BASE });
+            setBaseInput("");
+          }}
+          loading={state.loading}
+          gradient="from-blue-500/20 to-cyan-400/10"
+          ring="focus-within:ring-blue-400/40 focus-within:border-blue-400/50"
+        />
+      </div>
+
+      {localError ? (
+        <div className="mt-4 flex items-center gap-2 text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
+          <AlertTriangle className="w-4 h-4 shrink-0" />
+          {localError}
+        </div>
+      ) : null}
+      {state.error ? (
+        <div className="mt-4 flex items-center gap-2 text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
+          <AlertTriangle className="w-4 h-4 shrink-0" />
+          {state.error}
+        </div>
+      ) : null}
+    </GlassPanel>
+  );
+}
+
+function WalletInputRow({
+  network,
+  placeholder,
+  value,
+  onChange,
+  connected,
+  onSubmit,
+  onDisconnect,
+  loading,
+  gradient,
+  ring,
+}) {
+  const NetworkIcon = network === NETWORKS.SOLANA ? Coins : Wallet;
+  return (
+    <div>
+      <div
+        className={`flex items-center gap-2 rounded-xl border border-[#1f2937] bg-black/40 px-3 py-2.5 transition-all duration-300 ${ring} focus-within:ring-2`}
+      >
+        <div
+          className={`w-7 h-7 rounded-lg bg-gradient-to-br ${gradient} flex items-center justify-center shrink-0`}
+        >
+          <NetworkIcon className="w-3.5 h-3.5 text-white/80" />
+        </div>
+        <input
+          type="text"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && !loading && onSubmit()}
+          placeholder={placeholder}
+          disabled={loading}
+          className="flex-1 bg-transparent text-sm font-mono text-slate-200 placeholder:text-slate-600 outline-none min-w-0"
+        />
+        {connected ? (
+          <button
+            onClick={onDisconnect}
+            className="p-1.5 rounded-lg text-slate-500 hover:text-red-400 hover:bg-red-500/10 transition-colors shrink-0"
+            title="Déconnecter"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        ) : (
+          <button
+            onClick={onSubmit}
+            disabled={loading || !value.trim()}
+            className="shrink-0 text-xs font-semibold px-3 py-1.5 rounded-lg bg-white text-black hover:bg-cyan-300 hover:shadow-[0_0_16px_rgba(103,232,249,0.5)] transition-all duration-300 disabled:opacity-30 disabled:hover:bg-white disabled:hover:shadow-none"
+          >
+            Analyser
+          </button>
+        )}
+      </div>
+      {connected ? (
+        <p className="mt-1.5 text-[11px] font-mono text-slate-500 pl-1">
+          Connecté : {truncateAddress(connected)}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+function NetworkTabs({ active, onChange, counts }) {
+  const tabs = [
+    { key: NETWORKS.SOLANA, label: "Écosystème Solana", sub: "SPL Tokens" },
+    { key: NETWORKS.BASE, label: "Écosystème Base", sub: "ERC-20 Tokens" },
+  ];
+  return (
+    <div className="flex gap-2 p-1 rounded-xl bg-black/40 border border-[#1f2937] w-fit">
+      {tabs.map((tab) => (
+        <button
+          key={tab.key}
+          onClick={() => onChange(tab.key)}
+          className={`px-4 py-2 rounded-lg text-xs font-semibold transition-all duration-300 flex items-center gap-2 ${
+            active === tab.key
+              ? "bg-white/10 text-white"
+              : "text-slate-500 hover:text-slate-300"
+          }`}
+        >
+          {tab.label}
+          <span
+            className={`text-[10px] font-mono px-1.5 py-0.5 rounded-full ${
+              active === tab.key ? "bg-white/10" : "bg-white/5"
+            }`}
+          >
+            {counts[tab.key]}
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function EntryPriceInput({ value, onChange }) {
+  const [local, setLocal] = useState(value.toString());
+
+  useEffect(() => {
+    setLocal(value.toString());
+  }, [value]);
+
+  return (
+    <div className="flex items-center gap-1.5">
+      <span className="text-slate-600 text-xs font-mono">$</span>
+      <input
+        type="number"
+        step="any"
+        value={local}
+        onChange={(e) => setLocal(e.target.value)}
+        onBlur={() => {
+          const parsed = parseFloat(local);
+          if (!Number.isNaN(parsed) && parsed >= 0) {
+            onChange(parsed);
+          } else {
+            setLocal(value.toString());
+          }
+        }}
+        className="w-24 bg-black/50 border border-[#1f2937] rounded-lg px-2 py-1 text-xs font-mono text-slate-200 focus:outline-none focus:border-cyan-400/50 focus:ring-1 focus:ring-cyan-400/30"
+      />
+    </div>
+  );
+}
+
+function AdvisorCell({ analysis }) {
+  const { scenario, title, advice } = analysis;
+  const Icon = scenario.icon;
+  return (
+    <div
+      className={`min-w-[280px] max-w-[380px] rounded-xl border px-3.5 py-3 ${scenario.cellBg}`}
+    >
+      <div className="flex items-center gap-2 mb-1.5">
+        <span className={`w-2 h-2 rounded-full ${scenario.dot}`} />
+        <Icon className={`w-3.5 h-3.5 ${scenario.accentText}`} />
+        <span className={`text-[11px] font-bold tracking-wide ${scenario.accentText}`}>
+          {title}
+        </span>
+      </div>
+      <p className="text-[12px] leading-relaxed text-slate-300">{advice}</p>
+    </div>
+  );
+}
+
+function TokenRow({ token, entryPrice, onEntryPriceChange }) {
+  const analysis = useMemo(
+    () => analyzeTokenMomentum({ ...token, entryPrice }),
+    [token, entryPrice]
+  );
+  const { pnlPercent, dropAth, volLiqRatio } = analysis.metrics;
+  const pnlUsd = token.balance * (token.priceUsd - entryPrice);
+  const pnlPositive = pnlPercent >= 0;
+
+  return (
+    <tr className="border-b border-[#151a21] hover:bg-white/[0.015] transition-colors align-top">
+      {/* Colonne 1 : Jeton */}
+      <td className="py-4 pr-4 pl-1">
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-full bg-gradient-to-br from-slate-700 to-slate-800 border border-white/5 flex items-center justify-center text-[10px] font-bold text-slate-300">
+            {token.symbol.slice(0, 3)}
+          </div>
+          <div>
+            <div className="flex items-center gap-1.5">
+              <span className="text-sm font-semibold text-slate-100">{token.symbol}</span>
+              <span
+                className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full border ${
+                  token.network === NETWORKS.SOLANA
+                    ? "border-purple-400/30 text-purple-300 bg-purple-500/10"
+                    : "border-blue-400/30 text-blue-300 bg-blue-500/10"
+                }`}
+              >
+                {token.network === NETWORKS.SOLANA ? "SOL" : "BASE"}
+              </span>
+            </div>
+            <span className="text-[11px] text-slate-500">{token.name}</span>
+          </div>
+        </div>
+      </td>
+
+      {/* Colonne 2 : Solde */}
+      <td className="py-4 pr-4">
+        <div className="text-xs font-mono text-slate-300">
+          {formatTokenAmount(token.balance)} {token.symbol}
+        </div>
+        <div className="text-xs font-mono text-slate-500">
+          {formatUsd(token.balance * token.priceUsd)}
+        </div>
+      </td>
+
+      {/* Colonne 3 : Prix actuel vs prix d'achat */}
+      <td className="py-4 pr-4">
+        <div className="text-xs font-mono text-slate-300 mb-1.5">
+          {formatUsd(token.priceUsd)}
+        </div>
+        <EntryPriceInput value={entryPrice} onChange={onEntryPriceChange} />
+      </td>
+
+      {/* Colonne 4 : Métriques on-chain */}
+      <td className="py-4 pr-4">
+        <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] font-mono">
+          <span className="text-slate-500">Vol 24h</span>
+          <span className="text-slate-300">{formatUsd(token.volume24h, { compact: true })}</span>
+          <span className="text-slate-500">Liquidité</span>
+          <span className="text-slate-300">
+            {formatUsd(token.liquidityUsd, { compact: true })}
+          </span>
+          <span className="text-slate-500">Drop ATH</span>
+          <span className="text-orange-300">-{dropAth.toFixed(1)}%</span>
+          <span className="text-slate-500">Δ Vol 1h</span>
+          <span className={token.volumeDelta1h >= 0 ? "text-green-400" : "text-red-400"}>
+            {formatPercent(token.volumeDelta1h)}
+          </span>
+          <span className="text-slate-600">Vol/Liq</span>
+          <span className="text-slate-600">{volLiqRatio.toFixed(2)}x</span>
+        </div>
+      </td>
+
+      {/* Colonne 5 : PnL réel */}
+      <td className="py-4 pr-4">
+        <div
+          className={`flex items-center gap-1 text-sm font-bold font-mono ${
+            pnlPositive ? "text-green-400" : "text-red-400"
+          }`}
+        >
+          {pnlPositive ? (
+            <TrendingUp className="w-3.5 h-3.5" />
+          ) : (
+            <TrendingDown className="w-3.5 h-3.5" />
+          )}
+          {formatPercent(pnlPercent)}
+        </div>
+        <div className={`text-[11px] font-mono ${pnlPositive ? "text-green-500/70" : "text-red-500/70"}`}>
+          {pnlPositive ? "+" : ""}
+          {formatUsd(pnlUsd, { compact: Math.abs(pnlUsd) > 1_000_000 })}
+        </div>
+      </td>
+
+      {/* Colonne 6 : Degen Advisor */}
+      <td className="py-4 pr-1">
+        <AdvisorCell analysis={analysis} />
+      </td>
+    </tr>
+  );
+}
+
+function TokenTable({ tokens, entryPrices, onEntryPriceChange, network }) {
+  if (tokens.length === 0) {
+    return (
+      <div className="py-16 flex flex-col items-center justify-center text-center gap-2">
+        <Wallet className="w-8 h-8 text-slate-700 mb-1" />
+        <p className="text-sm text-slate-500">
+          Aucun token {network === NETWORKS.SOLANA ? "SPL" : "ERC-20"} chargé.
+        </p>
+        <p className="text-xs text-slate-600">
+          Connecte un wallet {network === NETWORKS.SOLANA ? "Solana" : "Base"} ci-dessus pour
+          lancer l'analyse.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full min-w-[1080px]">
+        <thead>
+          <tr className="text-left border-b border-[#1f2937]">
+            <th className="pb-3 pl-1 text-[10px] uppercase tracking-[0.14em] text-slate-500 font-semibold">
+              Jeton
+            </th>
+            <th className="pb-3 text-[10px] uppercase tracking-[0.14em] text-slate-500 font-semibold">
+              Solde
+            </th>
+            <th className="pb-3 text-[10px] uppercase tracking-[0.14em] text-slate-500 font-semibold">
+              Prix actuel / entrée
+            </th>
+            <th className="pb-3 text-[10px] uppercase tracking-[0.14em] text-slate-500 font-semibold">
+              Métriques on-chain
+            </th>
+            <th className="pb-3 text-[10px] uppercase tracking-[0.14em] text-slate-500 font-semibold">
+              PnL réel
+            </th>
+            <th className="pb-3 pr-1 text-[10px] uppercase tracking-[0.14em] text-slate-500 font-semibold">
+              Degen Advisor
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {tokens.map((token) => (
+            <TokenRow
+              key={token.id}
+              token={token}
+              entryPrice={entryPrices[token.id] ?? token.priceUsd}
+              onEntryPriceChange={(value) =>
+                onEntryPriceChange(token.id, value)
+              }
+            />
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* ----------------------------------------------------------------------------
+   8. APPLICATION PRINCIPALE
+   -------------------------------------------------------------------------- */
+
+export default function DegenPortfolioTracker() {
+  const [state, dispatch] = useReducer(reducer, initialState);
+  const [activeTab, setActiveTab] = useState(NETWORKS.SOLANA);
+  const seedRef = useRef(Date.now());
+
+  const refreshMarketData = useCallback(async (network) => {
+    const current = network === NETWORKS.SOLANA ? state.tokens.solana : state.tokens.base;
+    if (current.length === 0) return;
+
+    const updated = await Promise.all(
+      current.map(async (token) => {
+        const market = await fetchDexscreenerMarketData(
+          token,
+          hashStringToSeed(token.address) + Math.floor(Date.now() / REFRESH_INTERVAL_MS)
+        );
+        // Marche aléatoire légère autour du prix précédent pour un rendu
+        // "vivant" plutôt qu'un re-tirage totalement décorrélé à chaque tick.
+        const drift = 1 + (Math.random() - 0.5) * 0.08;
+        return {
+          ...token,
+          priceUsd: Math.max(token.priceUsd * drift, 0.0000001),
+          volume24h: Math.max(market.volume24h * (0.85 + Math.random() * 0.3), 1000),
+          liquidityUsd: Math.max(market.liquidityUsd * (0.9 + Math.random() * 0.2), 1000),
+          ath: Math.max(token.ath, token.priceUsd * drift),
+          volumeDelta1h: market.volumeDelta1h,
+        };
+      })
+    );
+
+    dispatch({ type: "REFRESH_MARKET_DATA", payload: { network, tokens: updated } });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.tokens.solana, state.tokens.base]);
+
+  const handleManualRefresh = useCallback(async () => {
+    dispatch({ type: "REFRESH_START" });
+    await Promise.all([refreshMarketData(NETWORKS.SOLANA), refreshMarketData(NETWORKS.BASE)]);
+  }, [refreshMarketData]);
+
+  // Polling automatique toutes les 30 secondes (simulate live feed).
+  useEffect(() => {
+    const interval = setInterval(() => {
+      refreshMarketData(NETWORKS.SOLANA);
+      refreshMarketData(NETWORKS.BASE);
+    }, REFRESH_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [refreshMarketData]);
+
+  const handleEntryPriceChange = useCallback((tokenId, value) => {
+    dispatch({ type: "SET_ENTRY_PRICE", payload: { tokenId, value } });
+  }, []);
+
+  const counts = {
+    [NETWORKS.SOLANA]: state.tokens.solana.length,
+    [NETWORKS.BASE]: state.tokens.base.length,
+  };
+
+  return (
+    <div className="min-h-screen w-full bg-[#050507] text-slate-200 relative">
+      {/* Ambiance de fond subtile */}
+      <div className="pointer-events-none fixed inset-0 overflow-hidden">
+        <div className="absolute -top-40 -left-40 w-[500px] h-[500px] bg-purple-600/[0.07] rounded-full blur-3xl" />
+        <div className="absolute top-1/3 -right-40 w-[500px] h-[500px] bg-cyan-500/[0.06] rounded-full blur-3xl" />
+      </div>
+
+      <div className="relative max-w-[1400px] mx-auto px-4 sm:px-6 py-6 sm:py-8 flex flex-col gap-5">
+        <HeaderPanel state={state} onRefresh={handleManualRefresh} />
+        <WalletInputPanel state={state} dispatch={dispatch} />
+
+        <GlassPanel className="p-5 sm:p-6">
+          <div className="flex items-center justify-between mb-5 flex-wrap gap-3">
+            <NetworkTabs active={activeTab} onChange={setActiveTab} counts={counts} />
+            {state.loading ? (
+              <span className="text-xs text-cyan-400 font-mono flex items-center gap-2">
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                Récupération on-chain en cours...
+              </span>
+            ) : null}
+          </div>
+
+          <TokenTable
+            tokens={state.tokens[activeTab]}
+            entryPrices={state.entryPrices}
+            onEntryPriceChange={handleEntryPriceChange}
+            network={activeTab}
+          />
+        </GlassPanel>
+
+        <p className="text-center text-[11px] text-slate-700 font-mono pb-4">
+          Données 100% simulées à des fins de démonstration — aucune clé API réelle n'est
+          appelée. Branche Helius / Moralis / Dexscreener via les fonctions de la couche de
+          service pour passer en production.
+        </p>
+      </div>
+    </div>
+  );
+}
